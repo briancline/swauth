@@ -43,9 +43,6 @@ from swauth import swift_version
 import swauth.authtypes
 
 
-MEMCACHE_TIME = swift_version.newer_than('1.7.7-dev')
-
-
 class Swauth(object):
     """
     Scalable authentication and authorization system that uses Swift as its
@@ -146,6 +143,35 @@ class Swauth(object):
         self.agent = '%(orig)s Swauth'
         self.swift_source = 'SWTH'
         self.default_storage_policy = conf.get('default_storage_policy', None)
+
+        self.cache = None
+        self.cache_time_key = 'time'
+        if not swift_version.newer_than('1.7.7-dev'):
+            self.cache_time_key = 'timeout'
+
+    def _load_cache_from_env(self, env):
+        if self.cache is None:
+            self.cache = cache_from_env(env)
+
+        if not self.cache:
+            raise Exception('No memcache set up; '
+                            'required for Swauth middleware')
+
+    def env_cache_get(self, env, key):
+        self._load_env_cache(env)
+        return self.cache.get(key)
+
+    def env_cache_set(self, env, key, value, time=0, **kwargs):
+        self._load_env_cache(env)
+
+        timeout = kwargs.pop('timeout', time)
+        kwargs.update({self.cache_time_key: timeout})
+
+        return self.cache.set(key, value, **kwargs)
+
+    def env_cache_delete(self, env, key):
+        self._load_env_cache(env)
+        return self.cache.delete(key)
 
     def make_pre_authed_request(self, env, method=None, path=None, body=None,
                                 headers=None):
@@ -274,14 +300,12 @@ class Swauth(object):
                   identifier for that user.
         """
         groups = None
-        memcache_client = cache_from_env(env)
-        if memcache_client:
-            memcache_key = '%s/auth/%s' % (self.reseller_prefix, token)
-            cached_auth_data = memcache_client.get(memcache_key)
-            if cached_auth_data:
-                expires, groups = cached_auth_data
-                if expires < time():
-                    groups = None
+        memcache_key = '%s/auth/%s' % (self.reseller_prefix, token)
+        cached_auth_data = self.env_cache_get(env, memcache_key)
+        if cached_auth_data:
+            expires, groups = cached_auth_data
+            if expires < time():
+                groups = None
 
         if env.get('HTTP_AUTHORIZATION'):
             if self.swauth_remote:
@@ -344,17 +368,12 @@ class Swauth(object):
                     conn.close()
                 if resp.status // 100 != 2:
                     return None
+
                 expires_from_now = float(resp.getheader('x-auth-ttl'))
                 groups = resp.getheader('x-auth-groups')
-                if memcache_client:
-                    if MEMCACHE_TIME:
-                        memcache_client.set(
-                            memcache_key, (time() + expires_from_now, groups),
-                            time=expires_from_now)
-                    else:
-                        memcache_client.set(
-                            memcache_key, (time() + expires_from_now, groups),
-                            timeout=expires_from_now)
+                self.env_cache_set(env,
+                    memcache_key, (time() + expires_from_now, groups),
+                    time=expires_from_now)
             else:
                 path = quote('/v1/%s/.token_%s/%s' %
                              (self.auth_account, token[-1], token))
@@ -372,17 +391,11 @@ class Swauth(object):
                     groups.remove('.admin')
                     groups.append(detail['account_id'])
                 groups = ','.join(groups)
-                if memcache_client:
-                    if MEMCACHE_TIME:
-                        memcache_client.set(
-                            memcache_key,
-                            (detail['expires'], groups),
-                            time=float(detail['expires'] - time()))
-                    else:
-                        memcache_client.set(
-                            memcache_key,
-                            (detail['expires'], groups),
-                            timeout=float(detail['expires'] - time()))
+
+                self.env_cache_set(env, memcache_key,
+                    (detail['expires'], groups),
+                    time=float(detail['expires'] - time()))
+
         return groups
 
     def authorize(self, req):
@@ -1304,10 +1317,10 @@ class Swauth(object):
                 if delete_token:
                     self.make_pre_authed_request(
                         req.environ, 'DELETE', path).get_response(self.app)
-                    memcache_client = cache_from_env(req.environ)
-                    if memcache_client:
-                        memcache_key = '%s/auth/%s' % (self.reseller_prefix, candidate_token)
-                        memcache_client.delete(memcache_key)
+
+                    memcache_key = '%s/auth/%s' % (self.reseller_prefix, candidate_token)
+                    self.env_cache_delete(req.environ, memcache_key)
+
         # Create a new token if one didn't exist
         if not token:
             # Retrieve account id, we'll save this in the token
@@ -1387,14 +1400,14 @@ class Swauth(object):
         if req.path_info or not token.startswith(self.reseller_prefix):
             return HTTPBadRequest(request=req)
         expires = groups = None
-        memcache_client = cache_from_env(req.environ)
-        if memcache_client:
-            memcache_key = '%s/auth/%s' % (self.reseller_prefix, token)
-            cached_auth_data = memcache_client.get(memcache_key)
-            if cached_auth_data:
-                expires, groups = cached_auth_data
-                if expires < time():
-                    groups = None
+
+        memcache_key = '%s/auth/%s' % (self.reseller_prefix, token)
+        cached_auth_data = self.env_cache_get(req.environ, memcache_key)
+        if cached_auth_data:
+            expires, groups = cached_auth_data
+            if expires < time():
+                groups = None
+
         if not groups:
             path = quote('/v1/%s/.token_%s/%s' %
                          (self.auth_account, token[-1], token))
@@ -1447,22 +1460,12 @@ class Swauth(object):
             self.itoken = '%sitk%s' % (self.reseller_prefix, uuid4().hex)
             memcache_key = '%s/auth/%s' % (self.reseller_prefix, self.itoken)
             self.itoken_expires = time() + self.token_life - 60
-            memcache_client = cache_from_env(env)
-            if not memcache_client:
-                raise Exception(
-                    'No memcache set up; required for Swauth middleware')
-            if MEMCACHE_TIME:
-                memcache_client.set(
-                    memcache_key,
-                    (self.itoken_expires,
-                     '.auth,.reseller_admin,%s.auth' % self.reseller_prefix),
-                    time=self.token_life)
-            else:
-                memcache_client.set(
-                    memcache_key,
-                    (self.itoken_expires,
-                     '.auth,.reseller_admin,%s.auth' % self.reseller_prefix),
-                    timeout=self.token_life)
+
+            self.env_cache_set(env, memcache_key,
+                (self.itoken_expires,
+                 '.auth,.reseller_admin,%s.auth' % self.reseller_prefix),
+                time=self.token_life)
+
         return self.itoken
 
     def get_admin_detail(self, req):
